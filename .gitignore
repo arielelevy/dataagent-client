@@ -39,3 +39,5 @@ models/
 # Temporary files
 *.tmp
 *.temp
+readme.txt
+deploy-info.txt

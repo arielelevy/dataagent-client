@@ -10,7 +10,7 @@ import {
   makeStyles,
   tokens,
 } from '@fluentui/react-components'
-import { Send24Regular } from '@fluentui/react-icons'
+import { Send24Regular, Delete24Regular } from '@fluentui/react-icons'
 import { fabricScopes, dataAgentConfig } from './authConfig'
 
 // CSS para las animaciones
@@ -96,42 +96,42 @@ const useStyles = makeStyles({
     fontSize: '14px',
     color: '#242424',
   },
-  // Steps panel - like Fabric Data Agent
+  // Steps panel - like Fabric Data Agent (estilo más sutil)
   stepsPanel: {
-    marginTop: '16px',
-    border: `1px solid #e0e0e0`,
+    marginBottom: '16px',
+    border: `1px solid #e8e8e8`,
     borderRadius: '8px',
-    backgroundColor: '#ffffff',
+    backgroundColor: '#fafafa',
   },
   stepsPanelHeader: {
-    padding: '12px 16px',
+    padding: '10px 16px',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
     cursor: 'pointer',
-    borderBottom: `1px solid ${tokens.colorNeutralStroke1}`,
+    borderBottom: `1px solid #e8e8e8`,
     ':hover': {
-      backgroundColor: tokens.colorNeutralBackground2,
+      backgroundColor: '#f0f0f0',
     },
   },
   stepsPanelHeaderLeft: {
     display: 'flex',
     alignItems: 'center',
     gap: '8px',
-    fontSize: '14px',
-    color: tokens.colorNeutralForeground2,
+    fontSize: '13px',
+    color: '#888',
   },
   responseTime: {
     display: 'flex',
     alignItems: 'center',
     gap: '4px',
-    fontSize: '13px',
-    color: tokens.colorNeutralForeground3,
+    fontSize: '12px',
+    color: '#999',
   },
   stepItem: {
-    padding: '12px 16px',
+    padding: '10px 16px',
     ':hover': {
-      backgroundColor: tokens.colorNeutralBackground2,
+      backgroundColor: '#f0f0f0',
     },
   },
   stepHeader: {
@@ -140,14 +140,15 @@ const useStyles = makeStyles({
     gap: '8px',
   },
   stepCheckmark: {
-    color: '#0f7b0f',
-    fontSize: '18px',
+    color: '#888',
+    fontSize: '16px',
     marginTop: '2px',
   },
   stepDescription: {
     flex: 1,
-    fontSize: '14px',
+    fontSize: '13px',
     lineHeight: '1.4',
+    color: '#666',
   },
   queryCodeHeader: {
     display: 'flex',
@@ -330,10 +331,16 @@ const useStyles = makeStyles({
 })
 
 
-function App({ isInTeams = false }) {
+// Generar un ID de sesión único por pestaña del navegador
+const sessionId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+function App() {
   const styles = useStyles()
   const { instance, accounts } = useMsal()
   const isAuthenticated = useIsAuthenticated()
+
+  // Track active threads per agent for cleanup
+  const activeThreadsRef = useRef({}) // { agentId: { threadId, runId } }
 
   // Multi-agent state
   const [availableAgents, setAvailableAgents] = useState([])
@@ -388,6 +395,21 @@ function App({ isInTeams = false }) {
         messages: prev[selectedAgentId]?.messages || []
       }
     }))
+  }
+
+  // Limpiar chat del agente seleccionado
+  const clearChat = () => {
+    if (!selectedAgentId || loading) return
+    setConversations(prev => ({
+      ...prev,
+      [selectedAgentId]: {
+        ...prev[selectedAgentId],
+        messages: []
+      }
+    }))
+    setCurrentSteps([])
+    setExpandedSteps({})
+    setExpandedStepItems({})
   }
 
   // Toggle expand/collapse para el panel de steps de un mensaje
@@ -630,13 +652,26 @@ function App({ isInTeams = false }) {
     try {
       const token = await getToken()
 
+      // Cancelar run/thread activo de este agente si existe (evita conflictos entre pestañas)
+      const activeInfo = activeThreadsRef.current[capturedAgentId]
+      if (activeInfo?.threadId && activeInfo?.runId) {
+        try {
+          console.log(`Cancelling previous run ${activeInfo.runId} on thread ${activeInfo.threadId}`)
+          await apiCall(token, `/threads/${activeInfo.threadId}/runs/${activeInfo.runId}/cancel`, 'POST', {}, agentEndpoint)
+          await apiCall(token, `/threads/${activeInfo.threadId}`, 'DELETE', null, agentEndpoint)
+        } catch (e) {
+          console.log('Cleanup of previous run failed (may already be done):', e.message)
+        }
+        delete activeThreadsRef.current[capturedAgentId]
+      }
+
       // 1. Crear assistant
       const assistant = await apiCall(token, '/assistants', 'POST', { model: 'not used' }, agentEndpoint)
       console.log('Assistant:', assistant)
 
-      // 2. Crear thread
-      const thread = await apiCall(token, '/threads', 'POST', {}, agentEndpoint)
-      console.log('Thread:', thread)
+      // 2. Crear thread (con metadata de sesión para evitar colisiones)
+      const thread = await apiCall(token, '/threads', 'POST', { metadata: { sessionId } }, agentEndpoint)
+      console.log('Thread:', thread, 'Session:', sessionId)
 
       // 3. Crear mensaje
       await apiCall(token, `/threads/${thread.id}/messages`, 'POST', {
@@ -662,6 +697,10 @@ function App({ isInTeams = false }) {
         throw new Error(`${response.status}: ${await response.text()}`)
       }
 
+      // Guardar info del thread/run activo para posible cancelación
+      // El runId vendrá en el primer evento del stream
+      activeThreadsRef.current[capturedAgentId] = { threadId: thread.id, runId: null }
+
       // Leer stream SSE
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
@@ -682,6 +721,15 @@ function App({ isInTeams = false }) {
 
             try {
               const event = JSON.parse(data)
+
+              // Capturar runId para posible cancelación
+              if (event.id && event.object === 'thread.run' && !activeThreadsRef.current[capturedAgentId]?.runId) {
+                activeThreadsRef.current[capturedAgentId] = {
+                  ...activeThreadsRef.current[capturedAgentId],
+                  runId: event.id
+                }
+                console.log('Run started:', event.id)
+              }
 
               // Evento de delta de texto (respuesta final)
               if (event.object === 'thread.message.delta') {
@@ -876,6 +924,9 @@ function App({ isInTeams = false }) {
         return updated
       })
 
+      // Limpiar tracking de thread/run activo
+      delete activeThreadsRef.current[capturedAgentId]
+
       // Cleanup del thread
       try {
         await apiCall(token, `/threads/${thread.id}`, 'DELETE', null, agentEndpoint)
@@ -886,6 +937,10 @@ function App({ isInTeams = false }) {
       console.error('Error:', error)
       const elapsed = Math.round((Date.now() - startTime) / 1000)
       setStreamingIndex(null)
+
+      // Limpiar tracking en caso de error
+      delete activeThreadsRef.current[capturedAgentId]
+
       updateAgentMessages((prev) => {
         const updated = [...prev]
         updated[botMsgIndex] = { role: 'assistant', content: `Error: ${error.message}`, steps: [], responseTime: elapsed, isStreaming: false }
@@ -935,6 +990,7 @@ function App({ isInTeams = false }) {
               selectedValue={selectedAgentId}
               onTabSelect={(_, data) => setSelectedAgentId(data.value)}
               size="small"
+              style={{ flex: 1 }}
             >
               {availableAgents.map(agent => (
                 <Tab key={agent.id} value={agent.id}>
@@ -942,6 +998,14 @@ function App({ isInTeams = false }) {
                 </Tab>
               ))}
             </TabList>
+            <Button
+              appearance="subtle"
+              icon={<Delete24Regular />}
+              onClick={clearChat}
+              disabled={loading || messages.length === 0}
+              title="Clear chat"
+              size="small"
+            />
           </div>
         </div>
       )}
@@ -1043,14 +1107,7 @@ function App({ isInTeams = false }) {
                   </div>
                 )}
 
-                {/* Texto de respuesta (solo si hay contenido o terminó streaming) */}
-                {(msg.content || !msg.isStreaming) && (
-                  <div className={styles.messageBot}>
-                    {msg.content || '...'}
-                  </div>
-                )}
-
-                {/* Panel de steps completados - solo después de terminar streaming */}
+                {/* Panel de steps completados - ARRIBA de la respuesta */}
                 {!msg.isStreaming && msg.steps && msg.steps.length > 0 && (
                   <div className={styles.stepsPanel}>
                     {/* Header del panel */}
@@ -1186,6 +1243,13 @@ function App({ isInTeams = false }) {
 
                       </>
                     )}
+                  </div>
+                )}
+
+                {/* Texto de respuesta (solo si hay contenido o terminó streaming) */}
+                {(msg.content || !msg.isStreaming) && (
+                  <div className={styles.messageBot}>
+                    {msg.content || '...'}
                   </div>
                 )}
               </div>
